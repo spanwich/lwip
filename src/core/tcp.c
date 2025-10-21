@@ -601,15 +601,38 @@ tcp_abandon(struct tcp_pcb *pcb, int reset)
       local_port = pcb->local_port;
       TCP_PCB_REMOVE_ACTIVE(pcb);
     }
+    /* ═══════════════════════════════════════════════════════════════════════════
+     * seL4-SAFE: NULL segment pointers immediately after freeing
+     * ═══════════════════════════════════════════════════════════════════════════
+     *
+     * Root Cause: tcp_abandon() frees segment lists (pcb->unacked, pcb->unsent)
+     * but leaves dangling pointers. If error callback (line 622) triggers any
+     * code that accesses these pointers before tcp_free() executes, use-after-free.
+     *
+     * Fix: NULL pointers immediately after tcp_segs_free() to break dangling refs.
+     * This ensures any callback or interrupt that accesses freed segments will:
+     * - See NULL pointer instead of freed memory
+     * - Take safe code paths (e.g., tcp_output line 1381 NULL check)
+     * - Avoid crashes from accessing garbage data
+     *
+     * Impact: Zero functional change, pure safety improvement.
+     * Tested on: seL4 microkernel (strong memory protection exposes use-after-free)
+     *
+     * Upstream Status: Consider submitting to lwIP project as general safety fix
+     * ═══════════════════════════════════════════════════════════════════════════
+     */
     if (pcb->unacked != NULL) {
       tcp_segs_free(pcb->unacked);
+      pcb->unacked = NULL;  /* seL4-SAFE: Break dangling pointer */
     }
     if (pcb->unsent != NULL) {
       tcp_segs_free(pcb->unsent);
+      pcb->unsent = NULL;  /* seL4-SAFE: Break dangling pointer */
     }
 #if TCP_QUEUE_OOSEQ
     if (pcb->ooseq != NULL) {
       tcp_segs_free(pcb->ooseq);
+      pcb->ooseq = NULL;  /* seL4-SAFE: Break dangling pointer */
     }
 #endif /* TCP_QUEUE_OOSEQ */
     tcp_backlog_accepted(pcb);
