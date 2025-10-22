@@ -635,6 +635,11 @@ tcp_abandon(struct tcp_pcb *pcb, int reset)
       pcb->ooseq = NULL;  /* seL4-SAFE: Break dangling pointer */
     }
 #endif /* TCP_QUEUE_OOSEQ */
+    /* seL4-SAFE: Reset queue length after freeing all segments
+     * Prevents assertion "tcp_enqueue_flags: invalid queue length" (tcp_out.c:1125)
+     * which expects: if (snd_queuelen != 0) then (unacked != NULL || unsent != NULL)
+     */
+    pcb->snd_queuelen = 0;
     tcp_backlog_accepted(pcb);
     if (send_rst) {
       LWIP_DEBUGF(TCP_RST_DEBUG, ("tcp_abandon: sending RST\n"));
