@@ -1279,12 +1279,15 @@ tcp_output(struct tcp_pcb *pcb)
     /* nothing to send: shortcut out of here */
     goto output_done;
   } else {
-    LWIP_DEBUGF(TCP_CWND_DEBUG,
-                ("tcp_output: snd_wnd %"TCPWNDSIZE_F", cwnd %"TCPWNDSIZE_F", wnd %"U32_F
-                 ", effwnd %"U32_F", seq %"U32_F", ack %"U32_F"\n",
-                 pcb->snd_wnd, pcb->cwnd, wnd,
-                 lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len,
-                 lwip_ntohl(seg->tcphdr->seqno), pcb->lastack));
+    /* seL4-SAFE: Check tcphdr before accessing in debug output */
+    if (seg->tcphdr != NULL) {
+      LWIP_DEBUGF(TCP_CWND_DEBUG,
+                  ("tcp_output: snd_wnd %"TCPWNDSIZE_F", cwnd %"TCPWNDSIZE_F", wnd %"U32_F
+                   ", effwnd %"U32_F", seq %"U32_F", ack %"U32_F"\n",
+                   pcb->snd_wnd, pcb->cwnd, wnd,
+                   lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len,
+                   lwip_ntohl(seg->tcphdr->seqno), pcb->lastack));
+    }
   }
 
   netif = tcp_route(pcb, &pcb->local_ip, &pcb->remote_ip);
@@ -1302,7 +1305,9 @@ tcp_output(struct tcp_pcb *pcb)
   }
 
   /* Handle the current segment not fitting within the window */
-  if (lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len > wnd) {
+  /* seL4-SAFE: Check tcphdr before accessing to prevent NULL deref crash */
+  if (seg->tcphdr != NULL &&
+      lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len > wnd) {
     /* We need to start the persistent timer when the next unsent segment does not fit
      * within the remaining (could be 0) send window and RTO timer is not running (we
      * have no in-flight data). If window is still too small after persist timer fires,
@@ -1330,6 +1335,7 @@ tcp_output(struct tcp_pcb *pcb)
   }
   /* data available and window allows it to be sent? */
   while (seg != NULL &&
+         seg->tcphdr != NULL &&  /* seL4-SAFE: Check tcphdr before accessing */
          lwip_ntohl(seg->tcphdr->seqno) - pcb->lastack + seg->len <= wnd) {
     LWIP_ASSERT("RST not expected here!",
                 (TCPH_FLAGS(seg->tcphdr) & TCP_RST) == 0);
@@ -1383,22 +1389,76 @@ tcp_output(struct tcp_pcb *pcb)
         useg = seg;
         /* unacked list is not empty? */
       } else {
-        /* In the case of fast retransmit, the packet should not go to the tail
-         * of the unacked queue, but rather somewhere before it. We need to check for
-         * this case. -STJ Jul 27, 2004 */
-        if (TCP_SEQ_LT(lwip_ntohl(seg->tcphdr->seqno), lwip_ntohl(useg->tcphdr->seqno))) {
-          /* add segment to before tail of unacked list, keeping the list sorted */
-          struct tcp_seg **cur_seg = &(pcb->unacked);
-          while (*cur_seg &&
-                 TCP_SEQ_LT(lwip_ntohl((*cur_seg)->tcphdr->seqno), lwip_ntohl(seg->tcphdr->seqno))) {
-            cur_seg = &((*cur_seg)->next );
+        /* ═══════════════════════════════════════════════════════════════════════════
+         * seL4-SAFE: Re-fetch useg from pcb->unacked to prevent stale pointer crash
+         *
+         * Root Cause:
+         * - Line 1327 cached useg = pcb->unacked (could be NULL from tcp_abandon fix)
+         * - Between 1327-1381, tcp_output_segment() callbacks can call tcp_abort()
+         * - tcp_abort() → tcp_abandon() sets pcb->unacked = NULL (our fix)
+         * - Line 1381 checks pcb->unacked but useg is stale cached value
+         * - Line 1389 crashes accessing useg->tcphdr when useg is NULL
+         *
+         * The Fix:
+         * - At line 1381, we KNOW pcb->unacked != NULL (in else branch)
+         * - But useg might be stale if pcb->unacked was modified since line 1327
+         * - Re-fetch useg and walk to tail to get current valid pointer
+         *
+         * Impact: Prevents NULL dereference crash at line 1389/1400
+         * ═══════════════════════════════════════════════════════════════════════════
+         */
+        /* seL4-SAFE: Re-fetch useg because it could have become stale
+         * IMPORTANT: pcb->unacked might be NULL even though line 1381 checked != NULL
+         * Reason: Interrupts/callbacks between 1381-1404 can call tcp_abort() → tcp_abandon()
+         * This is a Time-Of-Check-Time-Of-Use (TOCTOU) race condition
+         */
+        useg = pcb->unacked;  /* Re-fetch from current pcb->unacked */
+        if (useg != NULL) {
+          /* Find the tail of unacked list with circular list protection
+           * CRITICAL: Prevent infinite loop if list becomes circular
+           */
+          struct tcp_seg *start = useg;
+          int safety_counter = 0;
+          #define MAX_SEG_ITERATIONS 1000  /* Safety limit */
+          while (useg->next != NULL) {
+            useg = useg->next;
+            /* Circular list detection */
+            if (useg == start || ++safety_counter > MAX_SEG_ITERATIONS) {
+              LWIP_DEBUGF(TCP_OUTPUT_DEBUG | LWIP_DBG_LEVEL_SEVERE,
+                         ("tcp_output: CIRCULAR LIST DETECTED in unacked queue!\n"));
+              /* Break circular loop - this should never happen */
+              useg = NULL;
+              break;
+            }
           }
-          seg->next = (*cur_seg);
-          (*cur_seg) = seg;
+        }
+
+        /* seL4-SAFE: Only proceed if useg is valid */
+        if (useg != NULL) {
+          /* In the case of fast retransmit, the packet should not go to the tail
+           * of the unacked queue, but rather somewhere before it. We need to check for
+           * this case. -STJ Jul 27, 2004 */
+          if (TCP_SEQ_LT(lwip_ntohl(seg->tcphdr->seqno), lwip_ntohl(useg->tcphdr->seqno))) {
+            /* add segment to before tail of unacked list, keeping the list sorted */
+            struct tcp_seg **cur_seg = &(pcb->unacked);
+            while (*cur_seg &&
+                   TCP_SEQ_LT(lwip_ntohl((*cur_seg)->tcphdr->seqno), lwip_ntohl(seg->tcphdr->seqno))) {
+              cur_seg = &((*cur_seg)->next );
+            }
+            seg->next = (*cur_seg);
+            (*cur_seg) = seg;
+          } else {
+            /* add segment to tail of unacked list */
+            useg->next = seg;
+            useg = useg->next;
+          }
         } else {
-          /* add segment to tail of unacked list */
-          useg->next = seg;
-          useg = useg->next;
+          /* seL4-SAFE: pcb->unacked unexpectedly became NULL (edge case)
+           * This shouldn't happen (we're in else branch of line 1381 check)
+           * but handle defensively: treat as if unacked list was empty
+           */
+          pcb->unacked = seg;
+          seg->next = NULL;
         }
       }
       /* do not queue empty segments on the unacked list */
