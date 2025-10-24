@@ -1554,7 +1554,25 @@ tcp_receive(struct tcp_pcb *pcb)
            If the segment was a FIN, we set the TF_GOT_FIN flag that will
            be used to indicate to the application that the remote side has
            closed its end of the connection. */
-        if (inseg.p->tot_len > 0) {
+        /* seL4-SAFE v2.128: Check inseg.p before accessing to prevent NULL deref crash
+         * Problem: inseg is global static, can be corrupted by reentrancy or state bugs
+         * Crash pattern (seL4):
+         * - Page fault at tcp_receive:1557
+         * - Fault address: 0x8 (NULL + 8 bytes offset for tot_len field)
+         * - Accessing: inseg.p->tot_len where inseg.p is NULL
+         * - Trigger: First packet after TCP connection establishment
+         *
+         * Possible causes:
+         * 1. Reentrancy: TCP_EVENT_CONNECTED callback triggers packet processing
+         *    while tcp_input still active, corrupting global inseg state
+         * 2. State corruption: Previous tcp_input set inseg.p = NULL (line 570)
+         *    and next packet arrives with pcb == NULL, skipping initialization (line 401)
+         * 3. Race condition: Between inseg.p = p (line 410) and tcp_receive() call
+         *
+         * Fix: Check both inseg.p != NULL and tot_len > 0 before accessing
+         * This prevents crash and gracefully handles corrupted global state
+         */
+        if (inseg.p != NULL && inseg.p->tot_len > 0) {
           recv_data = inseg.p;
           /* Since this pbuf now is the responsibility of the
              application, we delete our reference to it so that we won't

@@ -635,11 +635,20 @@ tcp_abandon(struct tcp_pcb *pcb, int reset)
       pcb->ooseq = NULL;  /* seL4-SAFE: Break dangling pointer */
     }
 #endif /* TCP_QUEUE_OOSEQ */
-    /* seL4-SAFE: Reset queue length after freeing all segments
-     * Prevents assertion "tcp_enqueue_flags: invalid queue length" (tcp_out.c:1125)
-     * which expects: if (snd_queuelen != 0) then (unacked != NULL || unsent != NULL)
+    /* seL4-SAFE v2.129: REMOVED queue length reset
+     * Previous fix (v2.124) set snd_queuelen = 0 to prevent tcp_out.c:1125 assertion
+     * BUT this broke lwIP's internal queue tracking invariants, causing:
+     *   - tcp_in.c:876:  "pcb->snd_queuelen > 0" (trying to decrement already-0 value)
+     *   - tcp_in.c:1111: "pcb->snd_queuelen >= pbuf_clen(next->p)" (underflow)
+     *
+     * Root cause: lwIP expects snd_queuelen to match actual segment count.
+     * tcp_segs_free() already frees segments, so queue count naturally becomes 0.
+     * Manually setting it to 0 breaks lwIP's internal state consistency.
+     *
+     * Testing v2.129: Remove this line and verify if original tcp_out.c:1125 returns
+     * or if NULLing segment pointers (lines 626,630,635) was sufficient fix.
      */
-    pcb->snd_queuelen = 0;
+    /* pcb->snd_queuelen = 0; */  /* v2.129: DISABLED - breaks queue tracking */
     tcp_backlog_accepted(pcb);
     if (send_rst) {
       LWIP_DEBUGF(TCP_RST_DEBUG, ("tcp_abandon: sending RST\n"));
