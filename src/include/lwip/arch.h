@@ -83,16 +83,24 @@
 #include <stdlib.h>
 #endif
 
-/** Platform specific assertion handling.\n
- * Note the default implementation pulls in printf, fflush and abort, which may
- * in turn pull in a lot of standard libary code. In resource-constrained 
- * systems, this should be defined to something less resource-consuming.
+/** Platform specific assertion handling for seL4 microkernel.\n
+ *
+ * IMPORTANT: abort() does NOT work in seL4 microkernel!
+ * - abort() calls raise(SIGABRT) which requires POSIX signals
+ * - seL4 does not support POSIX signals in userspace
+ * - abort() returns instead of halting → execution continues with corrupt state
+ *
+ * Solution: Use seL4_DebugHalt() to immediately stop the system.
+ * This ensures the system halts on assertion failure instead of continuing
+ * with corrupted state (which leads to cascading failures).
  */
 #ifndef LWIP_PLATFORM_ASSERT
-#define LWIP_PLATFORM_ASSERT(x) do {printf("Assertion \"%s\" failed at line %d in %s\n", \
-                                     x, __LINE__, __FILE__); fflush(NULL); abort();} while(0)
+/* Forward declaration of seL4 debug halt syscall */
+extern void seL4_DebugHalt(void);
+
+#define LWIP_PLATFORM_ASSERT(x) do {printf("FATAL: Assertion \"%s\" failed at line %d in %s\n", \
+                                     x, __LINE__, __FILE__); fflush(NULL); seL4_DebugHalt();} while(0)
 #include <stdio.h>
-#include <stdlib.h>
 #endif
 
 /** Define this to 1 in arch/cc.h of your port if you do not want to
